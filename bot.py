@@ -36,7 +36,7 @@ dp.include_router(router)
 scheduler = AsyncIOScheduler()
 
 # ==========================================
-# ФРАЗЫ ДЛЯ РАНДОМИЗАЦИИ
+# ФРАЗЫ ДЛЯ РАНДОМИЗАЦИИ (МЕНЯЙ ТУТ)
 # ==========================================
 MORNING_PHRASES = [
     "Вставай, сонное хуйло. Какой план на сегодня?",
@@ -80,7 +80,6 @@ def init_db():
                 streak INTEGER DEFAULT 0
             )
         """)
-        # Добавили поле reminder_time для задач
         cur.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,7 +117,6 @@ def save_task(user_id, date_str, text, r_time=None):
         con.commit()
 
 def get_main_plan(user_id, date_str):
-    # Ищем задачу без времени (это и есть утренний план)
     with db_connect() as con:
         cur = con.cursor()
         cur.execute("SELECT id, plan_text, status FROM tasks WHERE user_id = ? AND date = ? AND reminder_time IS NULL", (user_id, date_str))
@@ -216,7 +214,7 @@ async def process_task_text(message: Message, state: FSMContext):
         await message.answer("Слишком коротко. Напиши нормально.")
         return
     await state.update_data(task_text=text)
-    await message.answer("Во сколько напомнить? Напиши время в формате ЧЧ:ММ (например, 18:30) или напиши 'Без времени':")
+    await message.answer("Во сколько напомнить? Напиши время в формате ЧЧ:ММ (например, 18:30):")
     await state.set_state(TaskState.waiting_for_time)
 
 @router.message(TaskState.waiting_for_time)
@@ -225,19 +223,14 @@ async def process_task_time(message: Message, state: FSMContext):
     data = await state.get_data()
     text = data['task_text']
     
-    # Проверка на "без времени"
-    if time_input in ["БЕЗ ВРЕМЕНИ", "НЕТ", "БЕЗ"]:
-        r_time = None
-        reply_text = f"Задача добавлена в общий список на сегодня.\n\nВечером спрошу за нее."
-    else:
-        # Валидация времени
-        try:
-            datetime.strptime(time_input, "%H:%M")
-            r_time = time_input
-            reply_text = f"Принято. Напомню в <b>{r_time}</b>. Не вздумай слить."
-        except ValueError:
-            await message.answer("Неправильный формат времени. Напиши как ЧЧ:ММ (например, 18:30).")
-            return
+    # Валидация времени (теперь обязательно)
+    try:
+        datetime.strptime(time_input, "%H:%M")
+        r_time = time_input
+        reply_text = f"Принято. Напомню в <b>{r_time}</b>. Не вздумай слить."
+    except ValueError:
+        await message.answer("Неправильный формат времени. Напиши как ЧЧ:ММ (например, 18:30).")
+        return
 
     # Сохраняем в БД на сегодня
     user_tz = int(get_user(message.from_user.id)[1])
@@ -265,8 +258,6 @@ async def handle_main_plan(message: Message):
     task = get_main_plan(message.from_user.id, today)
     
     if task:
-        # Если юзер пишет текст, а план уже есть, и это не команда /add — он пытается добавить задачу без времени
-        # Или просто болтает. Отправим его в кнопку "Добавить задачу".
         await message.answer("Ты уже сдал план на сегодня. Если хочешь добавить задачу, жми кнопку <b>➕ Добавить задачу</b>.", reply_markup=get_main_menu())
         return
 
@@ -337,21 +328,14 @@ async def handle_report(call: CallbackQuery):
         await call.answer("Ты кто?")
         return
 
-    user_tz = int(user[1])
-    user_time = datetime.utcnow() + timedelta(hours=3 + user_tz)
-    today = user_time.strftime("%Y-%m-%d")
-    
-    # Получаем ID задачи из callback_data (например, report_success_15)
     parts = call.data.split("_")
     task_id = int(parts[2])
     
     if action == "success":
         update_task_status(task_id, 'success')
-        # +10 очков, +1 стрик (только для утреннего плана)
-        if len(parts) == 3 and parts[1] == 'success': # логика для микро-задач и утреннего
+        if len(parts) == 3: 
             update_user_points_streak(user_id, 10, 1)
             
-            # Проверка на стрики
             new_streak = user[3] + 1
             streak_msg = STREAK_PHRASES.get(new_streak, "")
             
@@ -362,8 +346,8 @@ async def handle_report(call: CallbackQuery):
             await call.message.edit_text(response)
     else:
         update_task_status(task_id, 'fail')
-        if len(parts) == 3 and parts[1] == 'fail':
-            update_user_points_streak(user_id, -5, 0) # Стрик сбрасывается, -5 очков
+        if len(parts) == 3:
+            update_user_points_streak(user_id, -5, 0) 
             await call.message.edit_text("Ты меня разочаровал. Гатс бы не сдался. Завтра исправишься. (-5 очков)")
 
 # ==========================================
@@ -416,7 +400,6 @@ async def check_schedules():
                 await bot.send_message(user_id, "Ты не отчитался. Считаю, что ты сдулся. Завтра докажи, что ты не тряпка.")
         
         # 5. НАПОМИНАНИЯ ПО МИКРО-ЗАДАЧАМ
-        # Проверяем, есть ли задачи на это время
         micro_tasks = get_micro_tasks_by_time(user_id, today, current_time_str)
         for mt in micro_tasks:
             task_id, task_text = mt
