@@ -128,6 +128,13 @@ def get_micro_tasks_by_time(user_id, date_str, r_time):
         cur.execute("SELECT id, plan_text FROM tasks WHERE user_id = ? AND date = ? AND reminder_time = ? AND status = 'pending'", (user_id, date_str, r_time))
         return cur.fetchall()
 
+# НОВАЯ ФУНКЦИЯ ДЛЯ ВЫВОДА ВСЕХ ЗАДАЧ НА СЕГОДНЯ
+def get_all_pending_tasks_today(user_id, date_str):
+    with db_connect() as con:
+        cur = con.cursor()
+        cur.execute("SELECT id, plan_text, reminder_time FROM tasks WHERE user_id = ? AND date = ? AND status = 'pending'", (user_id, date_str))
+        return cur.fetchall()
+
 def update_task_status(task_id, status):
     with db_connect() as con:
         cur = con.cursor()
@@ -148,8 +155,8 @@ def get_timezone_offset(tz_str):
 # ==========================================
 def get_main_menu():
     kb = [
-        [KeyboardButton(text="➕ Добавить задачу"), KeyboardButton(text="👤 Мой профиль")],
-        [KeyboardButton(text="🏆 Таблица лидеров")]
+        [KeyboardButton(text="➕ Добавить задачу"), KeyboardButton(text="📋 Мои задачи")],
+        [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="🏆 Таблица лидеров")]
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -223,7 +230,6 @@ async def process_task_time(message: Message, state: FSMContext):
     data = await state.get_data()
     text = data['task_text']
     
-    # Валидация времени (теперь обязательно)
     try:
         datetime.strptime(time_input, "%H:%M")
         r_time = time_input
@@ -232,7 +238,6 @@ async def process_task_time(message: Message, state: FSMContext):
         await message.answer("Неправильный формат времени. Напиши как ЧЧ:ММ (например, 18:30).")
         return
 
-    # Сохраняем в БД на сегодня
     user_tz = int(get_user(message.from_user.id)[1])
     user_time = datetime.utcnow() + timedelta(hours=3 + user_tz)
     today = user_time.strftime("%Y-%m-%d")
@@ -242,9 +247,38 @@ async def process_task_time(message: Message, state: FSMContext):
     await message.answer(reply_text, reply_markup=get_main_menu())
 
 # ==========================================
+# ПРОСМОТР И ОТМЕТКА ЗАДАЧ ВРУЧНУЮ
+# ==========================================
+@router.message(F.text == "📋 Мои задачи")
+async def show_my_tasks(message: Message):
+    user = get_user(message.from_user.id)
+    if not user:
+        await message.answer("Сначала /start.")
+        return
+
+    user_tz = int(user[1])
+    user_time = datetime.utcnow() + timedelta(hours=3 + user_tz)
+    today = user_time.strftime("%Y-%m-%d")
+    
+    tasks = get_all_pending_tasks_today(message.from_user.id, today)
+    
+    if not tasks:
+        await message.answer("На сегодня у тебя нет активных задач. Либо все сделал, либо ничего не планировал.")
+        return
+        
+    await message.answer("📋 <b>Твои задачи на сегодня:</b>", reply_markup=get_main_menu())
+    for task in tasks:
+        task_id, text, r_time = task
+        time_str = f" (на {r_time})" if r_time else ""
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Сделал", callback_data=f"report_success_{task_id}")]
+        ])
+        await message.answer(f"🔹 <i>{text}</i>{time_str}", reply_markup=kb)
+
+# ==========================================
 # ОБРАБОТКА УТРЕННЕГО ПЛАНА (ТЕКСТОМ)
 # ==========================================
-@router.message(F.text & ~F.text.startswith('/') & ~F.text.startswith('➕') & ~F.text.startswith('👤') & ~F.text.startswith('🏆'))
+@router.message(F.text & ~F.text.startswith('/') & ~F.text.startswith('➕') & ~F.text.startswith('👤') & ~F.text.startswith('🏆') & ~F.text.startswith('📋'))
 async def handle_main_plan(message: Message):
     user = get_user(message.from_user.id)
     if not user:
@@ -316,7 +350,7 @@ async def cmd_top(message: Message):
     await message.answer(text, reply_markup=get_main_menu())
 
 # ==========================================
-# ОБРАБОТКА КНОПОК ОТЧЕТА (УТРО/ВЕЧЕР)
+# ОБРАБОТКА КНОПОК ОТЧЕТА
 # ==========================================
 @router.callback_query(F.data.startswith("report_"))
 async def handle_report(call: CallbackQuery):
@@ -343,12 +377,18 @@ async def handle_report(call: CallbackQuery):
             if streak_msg:
                 response += f"\n\n{streak_msg}"
             
-            await call.message.edit_text(response)
+            try:
+                await call.message.edit_text(f"{call.message.text}\n\n✅ <b>ВЫПОЛНЕНО.</b> {response}")
+            except:
+                await call.message.edit_text(response)
     else:
         update_task_status(task_id, 'fail')
         if len(parts) == 3:
             update_user_points_streak(user_id, -5, 0) 
-            await call.message.edit_text("Ты меня разочаровал. Гатс бы не сдался. Завтра исправишься. (-5 очков)")
+            try:
+                await call.message.edit_text(f"{call.message.text}\n\n❌ <b>ПРОСРАНО.</b> Гатс бы не сдался. (-5 очков)")
+            except:
+                await call.message.edit_text("Ты меня разочаровал. Гатс бы не сдался. Завтра исправишься. (-5 очков)")
 
 # ==========================================
 # ПЛАНИРОВЩИК (CRON)
@@ -369,13 +409,11 @@ async def check_schedules():
         current_time_str = user_time.strftime("%H:%M")
         today = user_time.strftime("%Y-%m-%d")
         
-        # 1. Утро (09:00) - спрашиваем план
         if current_time_str == "09:00":
             task = get_main_plan(user_id, today)
             if not task:
                 await bot.send_message(user_id, f"<b>{name}</b>, {random.choice(MORNING_PHRASES)}", reply_markup=get_main_menu())
         
-        # 2. Вечер (21:00) - требуем отчет за план
         elif current_time_str == "21:00":
             task = get_main_plan(user_id, today)
             if task and task[2] == 'pending':
@@ -385,13 +423,11 @@ async def check_schedules():
                 ])
                 await bot.send_message(user_id, f"Твой план был:\n<i>{task[1]}</i>\n\n<b>{random.choice(EVENING_PHRASES)}</b>", reply_markup=kb)
                 
-        # 3. Анти-слив утром (10:00)
         elif current_time_str == "10:00":
             task = get_main_plan(user_id, today)
             if not task:
                 await bot.send_message(user_id, "Ты проигнорировал меня. Это минус. Сдулся?")
                 
-        # 4. Анти-слив вечером (23:00)
         elif current_time_str == "23:00":
             task = get_main_plan(user_id, today)
             if task and task[2] == 'pending':
@@ -399,7 +435,6 @@ async def check_schedules():
                 update_user_points_streak(user_id, -5, 0)
                 await bot.send_message(user_id, "Ты не отчитался. Считаю, что ты сдулся. Завтра докажи, что ты не тряпка.")
         
-        # 5. НАПОМИНАНИЯ ПО МИКРО-ЗАДАЧАМ
         micro_tasks = get_micro_tasks_by_time(user_id, today, current_time_str)
         for mt in micro_tasks:
             task_id, task_text = mt
