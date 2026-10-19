@@ -22,9 +22,13 @@ import uvicorn
 # ==========================================
 # НАСТРОЙКИ
 # ==========================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "ТВОЙ_ТОКЕН_ЗДЕСЬ") 
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("❌ Ошибка: Переменная окружения BOT_TOKEN не задана!")
+
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "") 
 DB_PATH = "kicker.db"
+USE_POLLING = False # Для Render ставим False!
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -36,7 +40,7 @@ dp.include_router(router)
 scheduler = AsyncIOScheduler()
 
 # ==========================================
-# ФРАЗЫ ДЛЯ РАНДОМИЗАЦИИ (МЕНЯЙ ТУТ)
+# ФРАЗЫ ДЛЯ РАНДОМИЗАЦИИ
 # ==========================================
 MORNING_PHRASES = [
     "Вставай, сонное хуйло. Какой план на сегодня?",
@@ -53,13 +57,6 @@ EVENING_PHRASES = [
     "День прошел. Жми кнопки, не молчи.",
     "Время пришло. План выполнен или ты сдулся?"
 ]
-
-STREAK_PHRASES = {
-    3: "🔥 Ого, 3 дня без слива. Ты входишь во вкус.",
-    7: "🚀 7 дней подряд! Ты машина, а не человек.",
-    14: "👑 14 дней! Гатс тобой гордится. Не смей останавливаться.",
-    30: "🏆 30 ДНЕЙ! Ты легенда. Но расслабляться рано."
-}
 
 # ==========================================
 # БАЗА ДАННЫХ (SQLite)
@@ -104,11 +101,28 @@ def create_user(user_id, username, name, timezone):
         cur.execute("INSERT INTO users (user_id, username, name, timezone) VALUES (?, ?, ?, ?)", (user_id, username, name, timezone))
         con.commit()
 
-def update_user_points_streak(user_id, points_add, streak_add):
+# --- НОВЫЕ ФУНКЦИИ НАЧИСЛЕНИЯ ---
+def add_points(user_id, points_add):
+    """Просто добавляет очки, не трогая стрик (для бонусов)"""
     with db_connect() as con:
         cur = con.cursor()
-        cur.execute("UPDATE users SET points = points + ?, streak = streak + ? WHERE user_id = ?", (points_add, streak_add, user_id))
+        cur.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (points_add, user_id))
         con.commit()
+
+def add_points_and_increment_streak(user_id, points_add):
+    """Добавляет очки и увеличивает стрик на 1 (за выполнение плана)"""
+    with db_connect() as con:
+        cur = con.cursor()
+        cur.execute("UPDATE users SET points = points + ?, streak = streak + 1 WHERE user_id = ?", (points_add, user_id))
+        con.commit()
+
+def add_points_and_reset_streak(user_id, points_add):
+    """Добавляет/отнимает очки и сбрасывает стрик в 0 (за проебы)"""
+    with db_connect() as con:
+        cur = con.cursor()
+        cur.execute("UPDATE users SET points = points + ?, streak = 0 WHERE user_id = ?", (points_add, user_id))
+        con.commit()
+# -------------------------------
 
 def save_task(user_id, date_str, text, r_time=None):
     with db_connect() as con:
@@ -128,7 +142,6 @@ def get_micro_tasks_by_time(user_id, date_str, r_time):
         cur.execute("SELECT id, plan_text FROM tasks WHERE user_id = ? AND date = ? AND reminder_time = ? AND status = 'pending'", (user_id, date_str, r_time))
         return cur.fetchall()
 
-# НОВАЯ ФУНКЦИЯ ДЛЯ ВЫВОДА ВСЕХ ЗАДАЧ НА СЕГОДНЯ
 def get_all_pending_tasks_today(user_id, date_str):
     with db_connect() as con:
         cur = con.cursor()
@@ -247,7 +260,7 @@ async def process_task_time(message: Message, state: FSMContext):
     await message.answer(reply_text, reply_markup=get_main_menu())
 
 # ==========================================
-# ПРОСМОТР И ОТМЕТКА ЗАДАЧ ВРУЧНУЮ
+# ПРОСМОТР ЗАДАЧ И ОТМЕНА
 # ==========================================
 @router.message(F.text == "📋 Мои задачи")
 async def show_my_tasks(message: Message):
@@ -271,7 +284,8 @@ async def show_my_tasks(message: Message):
         task_id, text, r_time = task
         time_str = f" (на {r_time})" if r_time else ""
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Сделал", callback_data=f"report_success_{task_id}")]
+            [InlineKeyboardButton(text="✅ Сделал", callback_data=f"report_success_{task_id}"),
+             InlineKeyboardButton(text="❌ Отменить", callback_data=f"report_cancel_{task_id}")]
         ])
         await message.answer(f"🔹 <i>{text}</i>{time_str}", reply_markup=kb)
 
@@ -350,11 +364,13 @@ async def cmd_top(message: Message):
     await message.answer(text, reply_markup=get_main_menu())
 
 # ==========================================
-# ОБРАБОТКА КНОПОК ОТЧЕТА
+# ОБРАБОТКА КНОПОК ОТЧЕТА И ОТМЕНЫ
 # ==========================================
 @router.callback_query(F.data.startswith("report_"))
 async def handle_report(call: CallbackQuery):
-    action = call.data.split("_")[1]
+    parts = call.data.split("_")
+    action = parts[1] # success, fail, cancel
+    task_id = int(parts[2])
     user_id = call.from_user.id
     user = get_user(user_id)
     
@@ -362,33 +378,61 @@ async def handle_report(call: CallbackQuery):
         await call.answer("Ты кто?")
         return
 
-    parts = call.data.split("_")
-    task_id = int(parts[2])
-    
-    if action == "success":
+    # Получаем инфу о задаче, чтобы понять, давать ли очки (только за главный план)
+    with db_connect() as con:
+        cur = con.cursor()
+        cur.execute("SELECT reminder_time FROM tasks WHERE id = ?", (task_id,))
+        row = cur.fetchone()
+        is_main_plan = (row[0] is None) if row else False
+
+    if action == "cancel":
+        update_task_status(task_id, 'canceled')
+        await call.message.edit_text(f"{call.message.text}\n\n🚫 <b>ОТМЕНЕНО.</b>")
+        await call.answer("Задача отменена.")
+
+    elif action == "success":
         update_task_status(task_id, 'success')
-        if len(parts) == 3: 
-            update_user_points_streak(user_id, 10, 1)
-            
+        
+        response = ""
+        
+        # Логика для главного плана (очки + стрики)
+        if is_main_plan:
+            total_points = 5 # Базовая награда снижена до 5
             new_streak = user[3] + 1
-            streak_msg = STREAK_PHRASES.get(new_streak, "")
             
-            response = "Неплохо. Завтра планка выше. (+10 очков)"
-            if streak_msg:
-                response += f"\n\n{streak_msg}"
+            # Бонусы за стрики по новой системе
+            bonus_text = ""
+            if new_streak == 5:
+                total_points += 5
+                bonus_text = "\n🔥 <b>Бонус за 5 дней стрика: +5 очков!</b>"
+            elif new_streak >= 10 and new_streak % 10 == 0:
+                total_points += 10
+                bonus_text = f"\n🔥 <b>Бонус за {new_streak} дней стрика: +10 очков!</b>"
             
-            try:
-                await call.message.edit_text(f"{call.message.text}\n\n✅ <b>ВЫПОЛНЕНО.</b> {response}")
-            except:
-                await call.message.edit_text(response)
-    else:
+            add_points_and_increment_streak(user_id, total_points)
+            response = f"Неплохо. Завтра планка выше. (+{total_points} очков){bonus_text}"
+        
+        # Проверка на закрытие ВСЕХ задач дня (бонус +5)
+        user_tz = int(user[1])
+        user_time = datetime.utcnow() + timedelta(hours=3 + user_tz)
+        today = user_time.strftime("%Y-%m-%d")
+        pending_tasks = get_all_pending_tasks_today(user_id, today)
+        
+        if len(pending_tasks) == 0:
+            add_points(user_id, 5)
+            response += "\n🎉 <b>Все задачи на сегодня выполнены! Бонус: +5 очков!</b>"
+            
+        await call.message.edit_text(f"{call.message.text}\n\n✅ <b>ВЫПОЛНЕНО.</b> {response}")
+        await call.answer()
+
+    elif action == "fail":
         update_task_status(task_id, 'fail')
-        if len(parts) == 3:
-            update_user_points_streak(user_id, -5, 0) 
-            try:
-                await call.message.edit_text(f"{call.message.text}\n\n❌ <b>ПРОСРАНО.</b> Гатс бы не сдался. (-5 очков)")
-            except:
-                await call.message.edit_text("Ты меня разочаровал. Гатс бы не сдался. Завтра исправишься. (-5 очков)")
+        if is_main_plan:
+            add_points_and_reset_streak(user_id, -5)
+            await call.message.edit_text(f"{call.message.text}\n\n❌ <b>ПРОСРАНО.</b> Гатс бы не сдался. (-5 очков, стрик сброшен)")
+        else:
+            await call.message.edit_text(f"{call.message.text}\n\n❌ <b>ПРОСРАНО.</b>")
+        await call.answer()
 
 # ==========================================
 # ПЛАНИРОВЩИК (CRON)
@@ -409,40 +453,49 @@ async def check_schedules():
         current_time_str = user_time.strftime("%H:%M")
         today = user_time.strftime("%Y-%m-%d")
         
-        if current_time_str == "09:00":
-            task = get_main_plan(user_id, today)
-            if not task:
-                await bot.send_message(user_id, f"<b>{name}</b>, {random.choice(MORNING_PHRASES)}", reply_markup=get_main_menu())
-        
-        elif current_time_str == "21:00":
-            task = get_main_plan(user_id, today)
-            if task and task[2] == 'pending':
+        try:
+            # 1. Утро (09:00)
+            if current_time_str == "09:00":
+                task = get_main_plan(user_id, today)
+                if not task:
+                    await bot.send_message(user_id, f"<b>{name}</b>, {random.choice(MORNING_PHRASES)}", reply_markup=get_main_menu())
+            
+            # 2. Вечер (21:00)
+            elif current_time_str == "21:00":
+                task = get_main_plan(user_id, today)
+                if task and task[2] == 'pending':
+                    kb = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="✅ Сделал", callback_data=f"report_success_{task[0]}"),
+                         InlineKeyboardButton(text="❌ Просрал", callback_data=f"report_fail_{task[0]}")]
+                    ])
+                    await bot.send_message(user_id, f"Твой план был:\n<i>{task[1]}</i>\n\n<b>{random.choice(EVENING_PHRASES)}</b>", reply_markup=kb)
+                    
+            # 3. Анти-слив утром (10:00) - ШТРАФ И СБРОС СТРИКА
+            elif current_time_str == "10:00":
+                task = get_main_plan(user_id, today)
+                if not task:
+                    add_points_and_reset_streak(user_id, -5)
+                    await bot.send_message(user_id, "Ты проигнорировал меня. Это минус. Сдулся?\n(-5 очков, стрик сброшен)")
+                    
+            # 4. Анти-слив вечером (23:00) - ШТРАФ И СБРОС СТРИКА
+            elif current_time_str == "23:00":
+                task = get_main_plan(user_id, today)
+                if task and task[2] == 'pending':
+                    update_task_status(task[0], 'fail')
+                    add_points_and_reset_streak(user_id, -5)
+                    await bot.send_message(user_id, "Ты не отчитался. Считаю, что ты сдулся. Завтра докажи, что ты не тряпка.\n(-5 очков, стрик сброшен)")
+            
+            # 5. НАПОМИНАНИЯ ПО МИКРО-ЗАДАЧАМ
+            micro_tasks = get_micro_tasks_by_time(user_id, today, current_time_str)
+            for mt in micro_tasks:
+                task_id, task_text = mt
                 kb = InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="✅ Сделал", callback_data=f"report_success_{task[0]}"),
-                     InlineKeyboardButton(text="❌ Просрал", callback_data=f"report_fail_{task[0]}")]
+                    [InlineKeyboardButton(text="✅ Сделал", callback_data=f"report_success_{task_id}"),
+                     InlineKeyboardButton(text="❌ Просрал", callback_data=f"report_fail_{task_id}")]
                 ])
-                await bot.send_message(user_id, f"Твой план был:\n<i>{task[1]}</i>\n\n<b>{random.choice(EVENING_PHRASES)}</b>", reply_markup=kb)
-                
-        elif current_time_str == "10:00":
-            task = get_main_plan(user_id, today)
-            if not task:
-                await bot.send_message(user_id, "Ты проигнорировал меня. Это минус. Сдулся?")
-                
-        elif current_time_str == "23:00":
-            task = get_main_plan(user_id, today)
-            if task and task[2] == 'pending':
-                update_task_status(task[0], 'fail')
-                update_user_points_streak(user_id, -5, 0)
-                await bot.send_message(user_id, "Ты не отчитался. Считаю, что ты сдулся. Завтра докажи, что ты не тряпка.")
-        
-        micro_tasks = get_micro_tasks_by_time(user_id, today, current_time_str)
-        for mt in micro_tasks:
-            task_id, task_text = mt
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Сделал", callback_data=f"report_success_{task_id}"),
-                 InlineKeyboardButton(text="❌ Просрал", callback_data=f"report_fail_{task_id}")]
-            ])
-            await bot.send_message(user_id, f"⏰ <b>Пора делать:</b>\n<i>{task_text}</i>\n\nСделал?", reply_markup=kb)
+                await bot.send_message(user_id, f"⏰ <b>Пора делать:</b>\n<i>{task_text}</i>\n\nСделал?", reply_markup=kb)
+        except Exception as e:
+            logging.error(f"Ошибка при отправке сообщения юзеру {user_id}: {e}")
 
 # ==========================================
 # FASTAPI / WEBHOOK
@@ -452,11 +505,11 @@ async def lifespan(app: FastAPI):
     init_db()
     scheduler.add_job(check_schedules, 'cron', minute='*')
     scheduler.start()
-    if WEBHOOK_URL:
+    if not USE_POLLING and WEBHOOK_URL:
         await bot.set_webhook(WEBHOOK_URL)
         logging.info(f"Webhook установлен на {WEBHOOK_URL}")
     yield
-    if WEBHOOK_URL:
+    if not USE_POLLING and WEBHOOK_URL:
         await bot.delete_webhook()
     scheduler.shutdown()
 
@@ -472,5 +525,17 @@ async def webhook(request: Request):
 async def ping():
     return {"status": "alive"}
 
+# ==========================================
+# ЗАПУСК
+# ==========================================
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    if USE_POLLING:
+        logging.info("Запуск в режиме POLLING (локально).")
+        # Запускаем всё в одном цикле, чтобы не было ошибки Event loop is closed
+        async def run_polling():
+            await bot.delete_webhook(drop_pending_updates=True)
+            await dp.start_polling(bot)
+        asyncio.run(run_polling())
+    else:
+        logging.info("Запуск в режиме WEBHOOK (Render).")
+        uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
