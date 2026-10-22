@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Делай дело</title>
+    <!-- Подключаем скрипт Telegram Web App -->
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        :root {
+            --bg: #121212;
+            --card: #1E1E1E;
+            --text: #FFFFFF;
+            --accent: #39FF14; /* Кислотно-зеленый */
+            --danger: #FF3333;
+            --muted: #888888;
+        }
+        body {
+            margin: 0;
+            padding: 20px;
+            background-color: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: var(--card);
+            padding: 15px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 18px;
+            color: var(--accent);
+        }
+        .stats {
+            display: flex;
+            gap: 15px;
+            font-weight: bold;
+        }
+        .tasks-container {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            margin-bottom: 80px;
+        }
+        .task-card {
+            background: var(--card);
+            padding: 15px;
+            border-radius: 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-left: 4px solid var(--muted);
+            transition: 0.2s;
+        }
+        .task-card.main-plan {
+            border-left-color: var(--accent);
+            background: linear-gradient(90deg, rgba(57,255,20,0.1) 0%, var(--card) 100%);
+        }
+        .task-card.success {
+            opacity: 0.5;
+            border-left-color: var(--accent);
+        }
+        .task-card.success .task-text {
+            text-decoration: line-through;
+            color: var(--muted);
+        }
+        .task-card.fail {
+            border-left-color: var(--danger);
+        }
+        .task-info {
+            flex: 1;
+        }
+        .task-text {
+            font-size: 16px;
+        }
+        .task-time {
+            font-size: 12px;
+            color: var(--muted);
+            margin-top: 5px;
+            display: block;
+        }
+        .btn-check {
+            background: var(--card);
+            border: 2px solid var(--accent);
+            color: var(--accent);
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            font-weight: bold;
+            user-select: none;
+        }
+        .btn-check.active {
+            background: var(--accent);
+            color: var(--bg);
+        }
+        .add-btn {
+            position: fixed;
+            bottom: 20px;
+            left: 20px;
+            right: 20px;
+            background: var(--accent);
+            color: var(--bg);
+            padding: 15px;
+            text-align: center;
+            border-radius: 10px;
+            font-weight: bold;
+            font-size: 16px;
+            cursor: pointer;
+            box-shadow: 0 4px 10px rgba(57,255,20,0.3);
+            border: none;
+            z-index: 10;
+        }
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.8);
+            z-index: 20;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .modal-content {
+            background: var(--card);
+            padding: 20px;
+            border-radius: 12px;
+            width: 100%;
+            max-width: 400px;
+        }
+        .modal-content h2 {
+            margin-top: 0;
+            color: var(--accent);
+        }
+        .input-group {
+            margin-bottom: 15px;
+        }
+        .input-group label {
+            display: block;
+            margin-bottom: 5px;
+            color: var(--muted);
+            font-size: 14px;
+        }
+        .input-group input {
+            width: 100%;
+            padding: 10px;
+            background: var(--bg);
+            border: 1px solid var(--muted);
+            color: var(--text);
+            border-radius: 8px;
+            box-sizing: border-box;
+            font-size: 16px;
+        }
+        .modal-btns {
+            display: flex;
+            gap: 10px;
+            margin-top: 20px;
+        }
+        .btn-save {
+            flex: 1;
+            background: var(--accent);
+            color: var(--bg);
+            border: none;
+            padding: 12px;
+            border-radius: 8px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .btn-cancel {
+            flex: 1;
+            background: var(--danger);
+            color: white;
+            border: none;
+            padding: 12px;
+            border-radius: 8px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .empty-state {
+            text-align: center;
+            color: var(--muted);
+            margin-top: 40px;
+            line-height: 1.5;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Шапка с профилем -->
+    <div class="header">
+        <h1 id="user-name">Загрузка...</h1>
+        <div class="stats">
+            <span id="user-points">💰 0</span>
+            <span id="user-streak">🔥 0</span>
+        </div>
+    </div>
+
+    <!-- Список задач -->
+    <div class="tasks-container" id="tasks-list">
+        <!-- Задачи будут появляться здесь -->
+    </div>
+
+    <!-- Кнопка добавления -->
+    <button class="add-btn" onclick="openModal()">➕ Добавить задачу</button>
+
+    <!-- Модальное окно (всплывающее) для добавления -->
+    <div class="modal" id="add-modal">
+        <div class="modal-content">
+            <h2>Новая задача</h2>
+            <div class="input-group">
+                <label>Что нужно сделать?</label>
+                <input type="text" id="task-text" placeholder="Например: Пойти в зал">
+            </div>
+            <div class="input-group">
+                <label>Во сколько напомнить? (необязательно)</label>
+                <input type="time" id="task-time">
+            </div>
+            <div class="modal-btns">
+                <button class="btn-save" onclick="addTask()">Сохранить</button>
+                <button class="btn-cancel" onclick="closeModal()">Отмена</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Инициализация Telegram WebApp
+        const tg = window.Telegram.WebApp;
+        tg.ready();
+        tg.expand();
+
+        // Достаем зашифрованные данные пользователя
+        const initData = tg.initData;
+
+        // Универсальная функция для запросов к нашему бэкенду
+        async function apiRequest(endpoint, method = 'GET', body = null) {
+            const headers = {
+                'X-Init-Data': initData,
+                'Content-Type': 'application/json'
+            };
+            const options = { method, headers };
+            if (body) options.body = JSON.stringify(body);
+
+            const response = await fetch(endpoint, options);
+            if (!response.ok) {
+                const err = await response.json();
+                throw new Error(err.detail || 'Ошибка сервера');
+            }
+            return await response.json();
+        }
+
+        // Загружаем профиль
+        async function loadProfile() {
+            try {
+                const data = await apiRequest('/api/me');
+                document.getElementById('user-name').innerText = data.name;
+                document.getElementById('user-points').innerText = `💰 ${data.points}`;
+                document.getElementById('user-streak').innerText = `🔥 ${data.streak}`;
+            } catch (e) {
+                console.error(e);
+                document.getElementById('user-name').innerText = "Ошибка";
+            }
+        }
+
+        // Загружаем список задач
+        async function loadTasks() {
+            try {
+                const data = await apiRequest('/api/tasks');
+                const container = document.getElementById('tasks-list');
+                container.innerHTML = '';
+
+                if (data.tasks.length === 0) {
+                    container.innerHTML = '<div class="empty-state">Задач на сегодня нет.<br>Самое время поставить!</div>';
+                    return;
+                }
+
+                data.tasks.forEach(task => {
+                    const el = document.createElement('div');
+                    el.className = `task-card ${task.is_main ? 'main-plan' : ''} ${task.status}`;
+                    
+                    let timeHtml = task.time ? `<span class="task-time">⏰ ${task.time}</span>` : '';
+                    if (task.is_main) timeHtml = `<span class="task-time">🎯 ГЛАВНЫЙ ПЛАН</span>`;
+
+                    let checkBtnHtml = '';
+                    if (task.status === 'pending') {
+                        checkBtnHtml = `<div class="btn-check" onclick="completeTask(${task.id}, this)">✓</div>`;
+                    } else if (task.status === 'success') {
+                        checkBtnHtml = `<div class="btn-check active">✓</div>`;
+                    }
+
+                    el.innerHTML = `
+                        <div class="task-info">
+                            <div class="task-text">${task.text}</div>
+                            ${timeHtml}
+                        </div>
+                        ${checkBtnHtml}
+                    `;
+                    container.appendChild(el);
+                });
+            } catch (e) {
+                console.error(e);
+                // Если ошибка (например, нет авторизации), покажем алерт
+                if (tg.showAlert) tg.showAlert('Не удалось загрузить задачи');
+            }
+        }
+
+        // Отмечаем задачу выполненной
+        async function completeTask(taskId, element) {
+            try {
+                await apiRequest('/api/complete_task', 'POST', { task_id: taskId });
+                
+                // Меняем визуал кнопки и карточки без перезагрузки
+                element.classList.add('active');
+                const card = element.closest('.task-card');
+                card.classList.add('success');
+                card.classList.remove('pending');
+                
+                // Легкая вибрация
+                tg.HapticFeedback.notificationOccurred('success');
+                
+                loadProfile(); 
+            } catch (e) {
+                tg.showAlert(e.message);
+            }
+        }
+
+        // Добавляем новую задачу
+        async function addTask() {
+            const text = document.getElementById('task-text').value.trim();
+            const time = document.getElementById('task-time').value;
+
+            if (text.length < 3) {
+                tg.showAlert('Напиши задачу нормально (минимум 3 символа)');
+                return;
+            }
+
+            try {
+                await apiRequest('/api/add_task', 'POST', { 
+                    text: text, 
+                    time: time || null 
+                });
+                closeModal();
+                document.getElementById('task-text').value = '';
+                document.getElementById('task-time').value = '';
+                loadTasks(); // Обновляем список
+            } catch (e) {
+                tg.showAlert(e.message);
+            }
+        }
+
+        // Управление модальным окном
+        function openModal() {
+            document.getElementById('add-modal').style.display = 'flex';
+        }
+
+        function closeModal() {
+            document.getElementById('add-modal').style.display = 'none';
+        }
+
+        // Запускаем загрузку при открытии
+        loadProfile();
+        loadTasks();
+    </script>
+</body>
+</html>

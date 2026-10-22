@@ -4,16 +4,22 @@ import sqlite3
 import os
 import random
 import re
+import hashlib
+import hmac
+import json
+from urllib.parse import parse_qsl
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException, Header
+from fastapi.responses import HTMLResponse, FileResponse
+from pydantic import BaseModel
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, 
-    Update, ReplyKeyboardMarkup, KeyboardButton
+    Update, ReplyKeyboardMarkup, KeyboardButton, WebAppInfo
 )
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -27,9 +33,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("❌ Ошибка: Переменная окружения BOT_TOKEN не задана!")
 
+WEBAPP_URL = os.getenv("WEBAPP_URL", "https://kicker-bot-kp47.onrender.com/webapp")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "") 
 DB_PATH = "kicker.db"
-USE_POLLING = False # Для Render ставим False!
+USE_POLLING = False 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -41,7 +48,7 @@ dp.include_router(router)
 scheduler = AsyncIOScheduler()
 
 # ==========================================
-# ФРАЗЫ ДЛЯ РАНДОМИЗАЦИИ
+# ФРАЗЫ
 # ==========================================
 MORNING_PHRASES = [
     "Вставай, сонное хуйло. Какой план на сегодня?",
@@ -60,7 +67,7 @@ EVENING_PHRASES = [
 ]
 
 # ==========================================
-# БАЗА ДАННЫХ (SQLite)
+# БАЗА ДАННЫХ
 # ==========================================
 def db_connect():
     return sqlite3.connect(DB_PATH)
@@ -68,7 +75,6 @@ def db_connect():
 def init_db():
     with db_connect() as con:
         cur = con.cursor()
-        # Добавили колонки: morning_time, evening_time, timer_end, penalty_5min_sent, penalty_morning_sent
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -81,7 +87,8 @@ def init_db():
                 evening_time TEXT,
                 timer_end TEXT,
                 penalty_5min_sent INTEGER DEFAULT 0,
-                penalty_morning_sent INTEGER DEFAULT 0
+                penalty_morning_sent INTEGER DEFAULT 0,
+                last_report_msg_id INTEGER
             )
         """)
         cur.execute("""
@@ -99,7 +106,7 @@ def init_db():
 def get_user(user_id):
     with db_connect() as con:
         cur = con.cursor()
-        cur.execute("SELECT name, timezone, points, streak, morning_time, evening_time, timer_end, penalty_5min_sent, penalty_morning_sent FROM users WHERE user_id = ?", (user_id,))
+        cur.execute("SELECT name, timezone, points, streak, morning_time, evening_time, timer_end, penalty_5min_sent, penalty_morning_sent, last_report_msg_id FROM users WHERE user_id = ?", (user_id,))
         return cur.fetchone()
 
 def create_user(user_id, username, name, timezone, morning_time, evening_time):
@@ -177,7 +184,6 @@ def format_time_check(time_str, min_h, max_h):
         datetime.strptime(time_str, "%H:%M")
         parts = time_str.split(":")
         h = int(parts[0])
-        m = int(parts[1])
         if min_h <= h <= max_h:
             return True
     except:
@@ -185,10 +191,180 @@ def format_time_check(time_str, min_h, max_h):
     return False
 
 # ==========================================
+# WEBAPP AUTH
+# ==========================================
+def validate_webapp_data(init_data: str, bot_token: str) -> dict | None:
+    try:
+        parsed_data = dict(parse_qsl(init_data))
+        if "hash" not in parsed_data:
+            return None
+        
+        hash_str = parsed_data.pop("hash")
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed_data.items()))
+        
+        secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+        calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+        
+        if calculated_hash == hash_str:
+            return json.loads(parsed_data["user"])
+        return None
+    except Exception as e:
+        logging.error(f"WebApp auth error: {e}")
+        return None
+
+# ==========================================
+# FASTAPI APP & API
+# ==========================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    scheduler.add_job(check_schedules, 'cron', minute='*')
+    scheduler.start()
+    if not USE_POLLING and WEBHOOK_URL:
+        await bot.set_webhook(WEBHOOK_URL)
+        logging.info(f"Webhook установлен на {WEBHOOK_URL}")
+    yield
+    if not USE_POLLING and WEBHOOK_URL:
+        await bot.delete_webhook()
+    scheduler.shutdown()
+
+app = FastAPI(lifespan=lifespan)
+
+class TaskCreate(BaseModel):
+    text: str
+    time: str | None = None
+
+class TaskAction(BaseModel):
+    task_id: int
+
+@app.get("/webapp", response_class=HTMLResponse)
+async def get_webapp():
+    # Отдаем наш HTML файл из папки webapp
+    return FileResponse("webapp/index.html")
+
+@app.get("/api/me")
+async def api_get_me(x_init_data: str = Header(None)):
+    user_data = validate_webapp_data(x_init_data, BOT_TOKEN)
+    if not user_data:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    user = get_user(user_data['id'])
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return {"name": user[0], "points": user[2], "streak": user[3]}
+
+@app.get("/api/tasks")
+async def api_get_tasks(x_init_data: str = Header(None)):
+    user_data = validate_webapp_data(x_init_data, BOT_TOKEN)
+    if not user_data:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    user = get_user(user_data['id'])
+    user_tz = int(user[1])
+    user_time = datetime.utcnow() + timedelta(hours=3 + user_tz)
+    today = user_time.strftime("%Y-%m-%d")
+    
+    tasks = get_all_tasks_today(user_data['id'], today)
+    result = []
+    for t in tasks:
+        result.append({
+            "id": t[0],
+            "text": t[1],
+            "time": t[2],
+            "status": t[3],
+            "is_main": t[2] is None
+        })
+    return {"tasks": result}
+
+@app.post("/api/add_task")
+async def api_add_task(task: TaskCreate, x_init_data: str = Header(None)):
+    user_data = validate_webapp_data(x_init_data, BOT_TOKEN)
+    if not user_data:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    user = get_user(user_data['id'])
+    user_tz = int(user[1])
+    user_time = datetime.utcnow() + timedelta(hours=3 + user_tz)
+    today = user_time.strftime("%Y-%m-%d")
+    
+    save_task(user_data['id'], today, task.text, task.time)
+    return {"status": "ok"}
+
+@app.post("/api/complete_task")
+async def api_complete_task(action: TaskAction, x_init_data: str = Header(None)):
+    user_data = validate_webapp_data(x_init_data, BOT_TOKEN)
+    if not user_data:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    update_task_status(action.task_id, 'success')
+    return {"status": "ok"}
+
+@app.post("/api/submit_day")
+async def api_submit_day(x_init_data: str = Header(None)):
+    user_data = validate_webapp_data(x_init_data, BOT_TOKEN)
+    if not user_data:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    user_id = user_data['id']
+    user = get_user(user_id)
+    if not user or not user[6]:
+        raise HTTPException(status_code=400, detail="День уже закрыт или таймер не запущен")
+
+    user_tz = int(user[1])
+    user_time = datetime.utcnow() + timedelta(hours=3 + user_tz)
+    today = user_time.strftime("%Y-%m-%d")
+    
+    tasks = get_all_tasks_today(user_id, today)
+    has_pending = any(t[3] == 'pending' for t in tasks)
+    if has_pending:
+        raise HTTPException(status_code=400, detail="Есть незакрытые задачи")
+        
+    has_fail = any(t[3] == 'fail' for t in tasks)
+    main_plan = next((t for t in tasks if t[2] is None), None)
+    
+    if has_fail or not main_plan:
+        add_points_and_reset_streak(user_id, 0)
+        result_text = "❌ День закрыт. Но ты имеешь проебы или не ставил план утром. Очков нет, стрик сброшен."
+    else:
+        total_points = 5
+        new_streak = user[3] + 1
+        bonus_text = ""
+        if new_streak == 5:
+            total_points += 5
+            bonus_text = "\n🔥 Бонус за 5 дней стрика: +5 очков!"
+        elif new_streak >= 10 and new_streak % 10 == 0:
+            total_points += 10
+            bonus_text = f"\n🔥 Бонус за {new_streak} дней стрика: +10 очков!"
+            
+        add_points_and_increment_streak(user_id, total_points)
+        result_text = f"✅ День сдан! +{total_points} очков. {bonus_text}"
+    
+    if user[9]:
+        try:
+            await bot.edit_message_text(chat_id=user_id, message_id=user[9], text=f"{result_text}\n\n(Закрыто через мини-аппку)")
+        except Exception as e:
+            logging.error(f"Не удалось отредактировать сообщение: {e}")
+
+    clear_timer_and_penalty(user_id)
+    return {"status": "ok", "message": result_text}
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    update = Update.model_validate(await request.json(), context={"bot": bot})
+    await dp.feed_update(bot, update)
+    return {"ok": True}
+
+@app.get("/ping")
+async def ping():
+    return {"status": "alive"}
+
+# ==========================================
 # КЛАВИАТУРЫ
 # ==========================================
 def get_main_menu():
     kb = [
+        [KeyboardButton(text="📱 Открыть WebApp", web_app=WebAppInfo(url=WEBAPP_URL))],
         [KeyboardButton(text="➕ Добавить задачу"), KeyboardButton(text="📋 Мои задачи")],
         [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="🏆 Таблица лидеров")]
     ]
@@ -208,7 +384,7 @@ class TaskState(StatesGroup):
     waiting_for_time = State()
 
 # ==========================================
-# РЕГИСТРАЦИЯ
+# ХЕНДЛЕРЫ БОТА
 # ==========================================
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
@@ -253,7 +429,6 @@ async def process_evening_time(message: Message, state: FSMContext):
         datetime.strptime(time_str, "%H:%M")
         parts = time_str.split(":")
         h = int(parts[0])
-        # Проверка 18:00 - 23:59 или 00:00 - 02:00
         if not (18 <= h <= 23 or 0 <= h <= 2):
             raise ValueError
     except:
@@ -266,9 +441,6 @@ async def process_evening_time(message: Message, state: FSMContext):
     
     await message.answer(f"Всё, {data['name']}. Ты в системе. Завтра в {data['morning_time']} я спрошу твой план.", reply_markup=get_main_menu())
 
-# ==========================================
-# ДОБАВЛЕНИЕ ЗАДАЧ (FSM)
-# ==========================================
 @router.message(Command("add"))
 @router.message(F.text == "➕ Добавить задачу")
 async def start_add_task(message: Message, state: FSMContext):
@@ -311,9 +483,6 @@ async def process_task_time(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(reply_text, reply_markup=get_main_menu())
 
-# ==========================================
-# ПРОСМОТР ЗАДАЧ
-# ==========================================
 @router.message(F.text == "📋 Мои задачи")
 async def show_my_tasks(message: Message):
     user = get_user(message.from_user.id)
@@ -341,23 +510,21 @@ async def show_my_tasks(message: Message):
         ])
         await message.answer(f"🔹 <i>{text}</i>{time_str}", reply_markup=kb)
 
-# ==========================================
-# ОБРАБОТКА ТЕКСТОВ (Планы и Болтовня)
-# ==========================================
-@router.message(F.text & ~F.text.startswith('/') & ~F.text.startswith('➕') & ~F.text.startswith('👤') & ~F.text.startswith('🏆') & ~F.text.startswith('📋'))
+@router.message(F.text & ~F.text.startswith('/') & ~F.text.startswith('➕') & ~F.text.startswith('👤') & ~F.text.startswith('🏆') & ~F.text.startswith('📋') & ~F.text.startswith('📱'))
 async def handle_text(message: Message):
     user = get_user(message.from_user.id)
     if not user:
         await message.answer("Сначала /start.")
         return
 
-    user_id, name, tz, points, streak, m_time, e_time, timer_end_str, p5, pm = user
+    name, tz, points, streak, m_time, e_time, timer_end_str, p5, pm, last_msg = user
+    user_id = message.from_user.id
     user_tz = int(tz)
+    
     user_time = datetime.utcnow() + timedelta(hours=3 + user_tz)
     today = user_time.strftime("%Y-%m-%d")
     current_time_str = user_time.strftime("%H:%M")
 
-    # Проверка на активный таймер
     if timer_end_str:
         timer_end = datetime.strptime(timer_end_str, "%Y-%m-%d %H:%M")
         if user_time >= timer_end:
@@ -367,13 +534,11 @@ async def handle_text(message: Message):
             await message.answer("Ты еще не сдал день! Иди доделывай задачи.")
             return
 
-    # Проверка на "ночь" (после вечернего отчета и до утреннего вопроса)
-    # Условно: если сейчас время больше вечернего или меньше утреннего
     is_night = False
     if e_time > m_time:
         if current_time_str >= e_time or current_time_str < m_time:
             is_night = True
-    else: # Вечер переходит через полночь (например, вечер 01:00, утро 08:00)
+    else:
         if current_time_str >= e_time and current_time_str < m_time:
             is_night = True
 
@@ -381,15 +546,12 @@ async def handle_text(message: Message):
         await message.answer("Не пиши хуйни, иди спи, завтра работаем.")
         return
 
-    # Если утро и нет главного плана
     task = get_main_plan(user_id, today)
     if current_time_str >= m_time and current_time_str < e_time:
         if not task:
-            # Если он опоздал с утренним планом
             if current_time_str > m_time:
                 await message.answer("Утро уже прошло, план не принят. Хочешь добавить задачи — жми кнопку «➕ Добавить задачу».")
                 return
-            # Если он вовремя
             text = message.text.strip()
             if len(text) < 10:
                 await message.answer("Это не план. Напиши конкретное действие. Пока не напишешь — я не отстану.")
@@ -398,15 +560,11 @@ async def handle_text(message: Message):
             await message.answer("Принято. Вечером спрошу. Не вздумай слить.", reply_markup=get_main_menu())
             return
     
-    # Днем
     if task:
         await message.answer("Иди выполняй дела. Если хочешь добавить задачу, жми ➕ Добавить задачу.")
     else:
         await message.answer("У тебя нет плана на сегодня. Жми ➕ Добавить задачу.")
 
-# ==========================================
-# КОМАНДЫ ПРОФИЛЯ
-# ==========================================
 @router.message(Command("stats"))
 @router.message(F.text == "👤 Мой профиль")
 async def cmd_stats(message: Message):
@@ -415,7 +573,7 @@ async def cmd_stats(message: Message):
         await message.answer("Напиши /start.")
         return
     
-    name, tz, points, streak, m_time, e_time, timer, p5, pm = user
+    name, tz, points, streak, m_time, e_time, timer, p5, pm, last_msg = user
     with db_connect() as con:
         cur = con.cursor()
         cur.execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'success'", (message.from_user.id,))
@@ -450,9 +608,6 @@ async def cmd_top(message: Message):
     
     await message.answer(text, reply_markup=get_main_menu())
 
-# ==========================================
-# ОБРАБОТКА КНОПОК
-# ==========================================
 @router.callback_query(F.data.startswith("report_"))
 async def handle_report(call: CallbackQuery):
     parts = call.data.split("_")
@@ -463,6 +618,9 @@ async def handle_report(call: CallbackQuery):
     if not user:
         await call.answer("Ты кто?")
         return
+
+    name, tz, points, streak, m_time, e_time, timer_end_str, p5, pm, last_msg = user
+    user_tz = int(tz)
 
     if action == "cancel":
         task_id = int(parts[2])
@@ -479,14 +637,11 @@ async def handle_report(call: CallbackQuery):
     elif action == "fail":
         task_id = int(parts[2])
         update_task_status(task_id, 'fail')
-        clear_timer_and_penalty(user_id) # Очищаем таймер, раз он сам сдался
+        clear_timer_and_penalty(user_id)
         await call.message.edit_text(f"{call.message.text}\n\n❌ <b>ПРОСРАНО.</b> Гатс бы не сдался.")
         await call.answer()
 
     elif action == "submit_day":
-        # Нажатие на кнопку "Сдать день"
-        user_id, name, tz, points, streak, m_time, e_time, timer_end_str, p5, pm = user
-        user_tz = int(tz)
         user_time = datetime.utcnow() + timedelta(hours=3 + user_tz)
         today = user_time.strftime("%Y-%m-%d")
         
@@ -496,24 +651,19 @@ async def handle_report(call: CallbackQuery):
             return
 
         tasks = get_all_tasks_today(user_id, today)
-        
-        # Проверяем есть ли pending
         has_pending = any(t[3] == 'pending' for t in tasks)
         if has_pending:
             await call.answer("У тебя есть незакрытые задачи. Доделай их и жми снова.", show_alert=True)
             return
             
-        # Проверяем есть ли fail
         has_fail = any(t[3] == 'fail' for t in tasks)
         main_plan = next((t for t in tasks if t[2] is None), None)
         
         if has_fail or not main_plan:
-            # Если есть проебы или нет утреннего плана
             add_points_and_reset_streak(user_id, 0)
             await call.message.edit_text(f"{call.message.text}\n\n❌ <b>День закрыт.</b> Но ты имеешь проебы или не ставил план утром. Очков нет, стрик сброшен.")
             await call.answer("Провал.")
         else:
-            # Все условия выполнены
             bonus_text = ""
             total_points = 5
             new_streak = streak + 1
@@ -550,14 +700,11 @@ async def check_schedules():
         today = user_time.strftime("%Y-%m-%d")
         
         try:
-            # 1. Утреннее напоминание
             if current_time_str == m_time:
                 task = get_main_plan(user_id, today)
                 if not task:
                     await bot.send_message(user_id, f"<b>{name}</b>, {random.choice(MORNING_PHRASES)}", reply_markup=get_main_menu())
             
-            # 2. Штраф за утренний игнор (через 1 час после утреннего напоминания)
-            # Проверяем, прошло ли ровно n минут. Берем целевое время + 1 час.
             target_morning_penalty = (datetime.strptime(m_time, "%H:%M") + timedelta(hours=1)).strftime("%H:%M")
             if current_time_str == target_morning_penalty and pm == 0:
                 task = get_main_plan(user_id, today)
@@ -569,20 +716,18 @@ async def check_schedules():
                         con.commit()
                     await bot.send_message(user_id, "Ты проигнорировал меня утром. Это минус. Очки сняты, стрик сброшен.")
 
-            # 3. Вечерний отчет
             if current_time_str == e_time:
                 task = get_main_plan(user_id, today)
                 all_tasks = get_all_tasks_today(user_id, today)
                 pending = [t for t in all_tasks if t[3] == 'pending']
                 
-                # Отчет приходит, если есть план ИЛИ есть незакрытые допы
                 if task or pending:
-                    # Ставим таймер на 2 часа
                     timer_end_dt = user_time + timedelta(hours=2)
                     set_timer(user_id, timer_end_dt.strftime("%Y-%m-%d %H:%M"))
                     
                     kb = InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text="✅ Сдать день", callback_data="report_submit_day")]
+                        [InlineKeyboardButton(text="✅ Сдать день в чате", callback_data="report_submit_day")],
+                        [InlineKeyboardButton(text="📱 Сдать в WebApp", web_app=WebAppInfo(url=WEBAPP_URL))]
                     ])
                     
                     msg = f"Твой вечерний отчет.\n"
@@ -594,13 +739,16 @@ async def check_schedules():
                     else:
                         msg += "Все задачи закрыты. Жми «Сдать день».\n"
                     
-                    await bot.send_message(user_id, msg, reply_markup=kb)
+                    sent_msg = await bot.send_message(user_id, msg, reply_markup=kb)
+                    
+                    with db_connect() as con:
+                        cur = con.cursor()
+                        cur.execute("UPDATE users SET last_report_msg_id = ? WHERE user_id = ?", (sent_msg.message_id, user_id))
+                        con.commit()
             
-            # 4. Таймеры
             if timer_end_str:
                 timer_end = datetime.strptime(timer_end_str, "%Y-%m-%d %H:%M")
                 
-                # Предупреждение за 5 минут
                 if user_time >= timer_end - timedelta(minutes=5) and user_time < timer_end and p5 == 0:
                     with db_connect() as con:
                         cur = con.cursor()
@@ -608,22 +756,20 @@ async def check_schedules():
                         con.commit()
                     
                     kb = InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text="✅ Сдать день", callback_data="report_submit_day")]
+                        [InlineKeyboardButton(text="✅ Сдать день в чате", callback_data="report_submit_day")],
+                        [InlineKeyboardButton(text="📱 Сдать в WebApp", web_app=WebAppInfo(url=WEBAPP_URL))]
                     ])
                     await bot.send_message(user_id, "Осталось 5 минут. Если не будет выполнено — я сбрасываю стрики и не даю очки. Ебашь.", reply_markup=kb)
                 
-                # Конец таймера (2 часа)
                 elif user_time >= timer_end:
-                    # Обнуляем pending задачи
                     pending = get_pending_tasks_today(user_id, today)
                     for p in pending:
                         update_task_status(p[0], 'fail')
                         
-                    add_points_and_reset_streak(user_id, -5) # Штраф за игнор/провал
+                    add_points_and_reset_streak(user_id, -5)
                     clear_timer_and_penalty(user_id)
                     await bot.send_message(user_id, "Не все задачи были выполнены, не проеби день завтра. Доброй ночи. (-5 очков, стрик сброшен)")
 
-            # 5. Напоминания по микро-задачам
             pending_micro = get_pending_tasks_today(user_id, today)
             for mt in pending_micro:
                 task_id, task_text, r_time = mt
@@ -636,34 +782,6 @@ async def check_schedules():
 
         except Exception as e:
             logging.error(f"Ошибка при отправке юзеру {user_id}: {e}")
-
-# ==========================================
-# FASTAPI / WEBHOOK
-# ==========================================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    init_db()
-    scheduler.add_job(check_schedules, 'cron', minute='*')
-    scheduler.start()
-    if not USE_POLLING and WEBHOOK_URL:
-        await bot.set_webhook(WEBHOOK_URL)
-        logging.info(f"Webhook установлен на {WEBHOOK_URL}")
-    yield
-    if not USE_POLLING and WEBHOOK_URL:
-        await bot.delete_webhook()
-    scheduler.shutdown()
-
-app = FastAPI(lifespan=lifespan)
-
-@app.post("/webhook")
-async def webhook(request: Request):
-    update = Update.model_validate(await request.json(), context={"bot": bot})
-    await dp.feed_update(bot, update)
-    return {"ok": True}
-
-@app.get("/ping")
-async def ping():
-    return {"status": "alive"}
 
 # ==========================================
 # ЗАПУСК
