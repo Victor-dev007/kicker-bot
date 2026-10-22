@@ -224,7 +224,18 @@ async def lifespan(app: FastAPI):
     if not USE_POLLING and WEBHOOK_URL:
         await bot.set_webhook(WEBHOOK_URL)
         logging.info(f"Webhook установлен на {WEBHOOK_URL}")
+        
+        # --- НОВОЕ: Устанавливаем кнопку меню слева от поля ввода ---
+        from aiogram.types import MenuButtonWebApp
+        menu_btn = MenuButtonWebApp(text="📱 Открыть", web_app=WebAppInfo(url=WEBAPP_URL))
+        await bot.set_chat_menu_button(menu_button=menu_btn)
+        logging.info("Кнопка меню WebApp установлена.")
+        # -------------------------------------------------------------
+        
     yield
+    if not USE_POLLING and WEBHOOK_URL:
+        await bot.delete_webhook()
+    scheduler.shutdown()
     if not USE_POLLING and WEBHOOK_URL:
         await bot.delete_webhook()
     scheduler.shutdown()
