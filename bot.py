@@ -106,6 +106,7 @@ def init_db():
 def get_user(user_id):
     with db_connect() as con:
         cur = con.cursor()
+        # ТУТ 10 ПЕРЕМЕННЫХ
         cur.execute("SELECT name, timezone, points, streak, morning_time, evening_time, timer_end, penalty_5min_sent, penalty_morning_sent, last_report_msg_id FROM users WHERE user_id = ?", (user_id,))
         return cur.fetchone()
 
@@ -239,7 +240,6 @@ class TaskAction(BaseModel):
 
 @app.get("/webapp", response_class=HTMLResponse)
 async def get_webapp():
-    # Отдаем наш HTML файл из папки webapp
     return FileResponse("webapp/index.html")
 
 @app.get("/api/me")
@@ -517,6 +517,7 @@ async def handle_text(message: Message):
         await message.answer("Сначала /start.")
         return
 
+    # ИСПРАВЛЕНО! Теперь 10 переменных.
     name, tz, points, streak, m_time, e_time, timer_end_str, p5, pm, last_msg = user
     user_id = message.from_user.id
     user_tz = int(tz)
@@ -619,6 +620,7 @@ async def handle_report(call: CallbackQuery):
         await call.answer("Ты кто?")
         return
 
+    # ТУТ ТОЖЕ ИСПРАВЛЕНО НА 10 ПЕРЕМЕННЫХ
     name, tz, points, streak, m_time, e_time, timer_end_str, p5, pm, last_msg = user
     user_tz = int(tz)
 
