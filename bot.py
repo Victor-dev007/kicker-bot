@@ -235,7 +235,9 @@ async def lifespan(app: FastAPI):
     yield
     if not USE_POLLING and WEBHOOK_URL:
         await bot.delete_webhook()
-    scheduler.shutdown()
+    # Безопасное выключение планировщика
+    if scheduler.running:
+        scheduler.shutdown()
     if not USE_POLLING and WEBHOOK_URL:
         await bot.delete_webhook()
     scheduler.shutdown()
