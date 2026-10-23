@@ -153,6 +153,15 @@ def get_pending_tasks_today(user_id, date_str):
         cur.execute("SELECT id, plan_text, reminder_time FROM tasks WHERE user_id = ? AND date = ? AND status = 'pending'", (user_id, date_str))
         return cur.fetchall()
 
+# НОВАЯ ФУНКЦИЯ - ВСТАВЛЯЕМ СЮДА
+def get_task_status(task_id):
+    with db_connect() as con:
+        cur = con.cursor()
+        cur.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
+        row = cur.fetchone()
+        return row[0] if row else None
+# -------------------------
+
 def update_task_status(task_id, status):
     with db_connect() as con:
         cur = con.cursor()
@@ -235,12 +244,10 @@ async def lifespan(app: FastAPI):
     yield
     if not USE_POLLING and WEBHOOK_URL:
         await bot.delete_webhook()
+        
     # Безопасное выключение планировщика
     if scheduler.running:
         scheduler.shutdown()
-    if not USE_POLLING and WEBHOOK_URL:
-        await bot.delete_webhook()
-    scheduler.shutdown()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -310,6 +317,9 @@ async def api_complete_task(action: TaskAction, x_init_data: str = Header(None))
     if not user_data:
         raise HTTPException(status_code=401, detail="Unauthorized")
     
+    if get_task_status(action.task_id) != 'pending':
+        raise HTTPException(status_code=400, detail="Задача уже закрыта")
+        
     update_task_status(action.task_id, 'success')
     return {"status": "ok"}
 
@@ -318,7 +328,10 @@ async def api_fail_task(action: TaskAction, x_init_data: str = Header(None)):
     user_data = validate_webapp_data(x_init_data, BOT_TOKEN)
     if not user_data:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    
+        
+    if get_task_status(action.task_id) != 'pending':
+        raise HTTPException(status_code=400, detail="Задача уже закрыта")
+        
     update_task_status(action.task_id, 'fail')
     clear_timer_and_penalty(user_data['id'])
     return {"status": "ok"}
@@ -632,6 +645,7 @@ async def cmd_top(message: Message):
     
     await message.answer(text, reply_markup=get_main_menu())
 
+
 @router.callback_query(F.data.startswith("report_"))
 async def handle_report(call: CallbackQuery):
     parts = call.data.split("_")
@@ -643,9 +657,14 @@ async def handle_report(call: CallbackQuery):
         await call.answer("Ты кто?")
         return
 
-    # ТУТ ТОЖЕ ИСПРАВЛЕНО НА 10 ПЕРЕМЕННЫХ
+    # Проверка на двойное нажатие
+    if action in ["success", "fail", "cancel"]:
+        task_id = int(parts[2])
+        if get_task_status(task_id) != 'pending':
+            await call.answer("Эта задача уже закрыта (выполнена или просрана).", show_alert=True)
+            return
+
     name, tz, points, streak, m_time, e_time, timer_end_str, p5, pm, last_msg = user
-    user_tz = int(tz)
 
     if action == "cancel":
         task_id = int(parts[2])
