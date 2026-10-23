@@ -311,6 +311,16 @@ async def api_complete_task(action: TaskAction, x_init_data: str = Header(None))
     update_task_status(action.task_id, 'success')
     return {"status": "ok"}
 
+@app.post("/api/fail_task")
+async def api_fail_task(action: TaskAction, x_init_data: str = Header(None)):
+    user_data = validate_webapp_data(x_init_data, BOT_TOKEN)
+    if not user_data:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    update_task_status(action.task_id, 'fail')
+    clear_timer_and_penalty(user_data['id'])
+    return {"status": "ok"}
+
 @app.post("/api/submit_day")
 async def api_submit_day(x_init_data: str = Header(None)):
     user_data = validate_webapp_data(x_init_data, BOT_TOKEN)

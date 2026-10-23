@@ -98,10 +98,39 @@
             cursor: pointer;
             font-weight: bold;
             user-select: none;
+            transition: 0.2s;
         }
         .btn-check.active {
             background: var(--accent);
-            color: var(--bg);
+            color: #FFFFFF;
+        }
+        
+        /* НОВОЕ: Контейнер для двух кнопок */
+        .task-buttons {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        /* НОВОЕ: Кнопка провала (крестик) */
+        .btn-fail {
+            background: var(--card);
+            border: 2px solid var(--danger);
+            color: var(--danger);
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            font-weight: bold;
+            user-select: none;
+            transition: 0.2s;
+        }
+        .btn-fail.active {
+            background: var(--danger);
+            color: #FFFFFF;
         }
         .add-btn {
             position: fixed;
@@ -291,9 +320,16 @@
 
                     let checkBtnHtml = '';
                     if (task.status === 'pending') {
-                        checkBtnHtml = `<div class="btn-check" onclick="completeTask(${task.id}, this)">✓</div>`;
+                        checkBtnHtml = `
+                            <div class="task-buttons">
+                                <div class="btn-check" onclick="completeTask(${task.id}, this)">✓</div>
+                                <div class="btn-fail" onclick="failTask(${task.id}, this)">✕</div>
+                            </div>
+                        `;
                     } else if (task.status === 'success') {
                         checkBtnHtml = `<div class="btn-check active">✓</div>`;
+                    } else if (task.status === 'fail') {
+                        checkBtnHtml = `<div class="btn-fail active">✕</div>`;
                     }
 
                     el.innerHTML = `
@@ -327,6 +363,26 @@
                 tg.HapticFeedback.notificationOccurred('success');
                 
                 loadProfile(); 
+            } catch (e) {
+                tg.showAlert(e.message);
+            }
+        }
+
+                // Отмечаем задачу проваленной
+        async function failTask(taskId, element) {
+            try {
+                await apiRequest('/api/fail_task', 'POST', { task_id: taskId });
+                
+                // Меняем визуал карточки
+                const card = element.closest('.task-card');
+                card.classList.add('fail');
+                card.classList.remove('pending');
+                
+                // Перерисовываем кнопки (убираем зеленую галочку, оставляем только красный крестик)
+                const btnContainer = element.parentElement;
+                btnContainer.innerHTML = `<div class="btn-fail active">✕</div>`;
+                
+                tg.HapticFeedback.notificationOccurred('error');
             } catch (e) {
                 tg.showAlert(e.message);
             }
